@@ -503,7 +503,7 @@ class KDiffusionSampler:
             'image_cond': image_conditioning, 
             'uncond': unconditional_conditioning, 
             'cond_scale': p.cfg_scale
-        }, disable=False, callback=self.callback_state, **extra_params_kwargs))
+        }, disable=cmd_opts.disable_console_progressbars, callback=self.callback_state, **extra_params_kwargs))
 
         return samples
 
@@ -529,7 +529,7 @@ class KDiffusionSampler:
             'image_cond': image_conditioning, 
             'uncond': unconditional_conditioning, 
             'cond_scale': p.cfg_scale
-        }, disable=False, callback=self.callback_state, **extra_params_kwargs))
+        }, disable=cmd_opts.disable_console_progressbars, callback=self.callback_state, **extra_params_kwargs))
 
         return samples
 
