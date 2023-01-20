@@ -3,6 +3,7 @@ import math
 import os
 import sys
 import traceback
+import shutil
 
 import numpy as np
 from PIL import Image
@@ -14,13 +15,11 @@ from typing import Callable, List, OrderedDict, Tuple
 from functools import partial
 from dataclasses import dataclass
 
-from modules import processing, shared, images, devices, sd_models, sd_samplers
+from modules import processing, shared, images, devices, sd_models, sd_samplers, sd_vae
 from modules.shared import opts
 import modules.gfpgan_model
 from modules.ui import plaintext_to_html
 import modules.codeformer_model
-import piexif
-import piexif.helper
 import gradio as gr
 import safetensors.torch
 
@@ -58,6 +57,9 @@ cached_images: LruCache = LruCache(max_size=5)
 def run_extras(extras_mode, resize_mode, image, image_folder, input_dir, output_dir, show_extras_results, gfpgan_visibility, codeformer_visibility, codeformer_weight, upscaling_resize, upscaling_resize_w, upscaling_resize_h, upscaling_crop, extras_upscaler_1, extras_upscaler_2, extras_upscaler_2_visibility, upscale_first: bool, save_output: bool = True):
     devices.torch_gc()
 
+    shared.state.begin()
+    shared.state.job = 'extras'
+
     imageArr = []
     # Also keep track of original file names
     imageNameArr = []
@@ -94,6 +96,7 @@ def run_extras(extras_mode, resize_mode, image, image_folder, input_dir, output_
     # Extra operation definitions
 
     def run_gfpgan(image: Image.Image, info: str) -> Tuple[Image.Image, str]:
+        shared.state.job = 'extras-gfpgan'
         restored_img = modules.gfpgan_model.gfpgan_fix_faces(np.array(image, dtype=np.uint8))
         res = Image.fromarray(restored_img)
 
@@ -104,6 +107,7 @@ def run_extras(extras_mode, resize_mode, image, image_folder, input_dir, output_
         return (res, info)
 
     def run_codeformer(image: Image.Image, info: str) -> Tuple[Image.Image, str]:
+        shared.state.job = 'extras-codeformer'
         restored_img = modules.codeformer_model.codeformer.restore(np.array(image, dtype=np.uint8), w=codeformer_weight)
         res = Image.fromarray(restored_img)
 
@@ -114,6 +118,7 @@ def run_extras(extras_mode, resize_mode, image, image_folder, input_dir, output_
         return (res, info)
 
     def upscale(image, scaler_index, resize, mode, resize_w, resize_h, crop):
+        shared.state.job = 'extras-upscale'
         upscaler = shared.sd_upscalers[scaler_index]
         res = upscaler.scaler.upscale(image, resize, upscaler.data_path)
         if mode == 1 and crop:
@@ -180,6 +185,9 @@ def run_extras(extras_mode, resize_mode, image, image_folder, input_dir, output_
     for image, image_name in zip(imageArr, imageNameArr):
         if image is None:
             return outputs, "Please select an input image.", ''
+
+        shared.state.textinfo = f'Processing image {image_name}'
+        
         existing_pnginfo = image.info or {}
 
         image = image.convert("RGB")
@@ -193,6 +201,10 @@ def run_extras(extras_mode, resize_mode, image, image_folder, input_dir, output_
         else:
             basename = ''
 
+        if opts.enable_pnginfo: # append info before save
+            image.info = existing_pnginfo
+            image.info["extras"] = info
+
         if save_output:
             # Add upscaler name as a suffix.
             suffix = f"-{shared.sd_upscalers[extras_upscaler_1].name}" if shared.opts.use_upscaler_name_as_suffix else ""
@@ -202,10 +214,6 @@ def run_extras(extras_mode, resize_mode, image, image_folder, input_dir, output_
 
             images.save_image(image, path=outpath, basename=basename, seed=None, prompt=None, extension=opts.samples_format, info=info, short_filename=True,
                             no_prompt=True, grid=False, pnginfo_section_name="extras", existing_info=existing_pnginfo, forced_filename=None, suffix=suffix)
-
-        if opts.enable_pnginfo:
-            image.info = existing_pnginfo
-            image.info["extras"] = info
 
         if extras_mode != 2 or show_extras_results :
             outputs.append(image)
@@ -241,7 +249,51 @@ def run_pnginfo(image):
     return '', geninfo, info
 
 
-def run_modelmerger(primary_model_name, secondary_model_name, tertiary_model_name, interp_method, multiplier, save_as_half, custom_name, checkpoint_format):
+def create_config(ckpt_result, config_source, a, b, c):
+    def config(x):
+        res = sd_models.find_checkpoint_config(x) if x else None
+        return res if res != shared.sd_default_config else None
+
+    if config_source == 0:
+        cfg = config(a) or config(b) or config(c)
+    elif config_source == 1:
+        cfg = config(b)
+    elif config_source == 2:
+        cfg = config(c)
+    else:
+        cfg = None
+
+    if cfg is None:
+        return
+
+    filename, _ = os.path.splitext(ckpt_result)
+    checkpoint_filename = filename + ".yaml"
+
+    print("Copying config:")
+    print("   from:", cfg)
+    print("     to:", checkpoint_filename)
+    shutil.copyfile(cfg, checkpoint_filename)
+
+
+checkpoint_dict_skip_on_merge = ["cond_stage_model.transformer.text_model.embeddings.position_ids"]
+
+
+def to_half(tensor, enable):
+    if enable and tensor.dtype == torch.float:
+        return tensor.half()
+
+    return tensor
+
+
+def run_modelmerger(id_task, primary_model_name, secondary_model_name, tertiary_model_name, interp_method, multiplier, save_as_half, custom_name, checkpoint_format, config_source, bake_in_vae):
+    shared.state.begin()
+    shared.state.job = 'model-merge'
+
+    def fail(message):
+        shared.state.textinfo = message
+        shared.state.end()
+        return [*[gr.update() for _ in range(4)], message]
+
     def weighted_sum(theta0, theta1, alpha):
         return ((1 - alpha) * theta0) + (alpha * theta1)
 
@@ -251,43 +303,93 @@ def run_modelmerger(primary_model_name, secondary_model_name, tertiary_model_nam
     def add_difference(theta0, theta1_2_diff, alpha):
         return theta0 + (alpha * theta1_2_diff)
 
-    primary_model_info = sd_models.checkpoints_list[primary_model_name]
-    secondary_model_info = sd_models.checkpoints_list[secondary_model_name]
-    tertiary_model_info = sd_models.checkpoints_list.get(tertiary_model_name, None)
-    result_is_inpainting_model = False
+    def filename_weighted_sum():
+        a = primary_model_info.model_name
+        b = secondary_model_info.model_name
+        Ma = round(1 - multiplier, 2)
+        Mb = round(multiplier, 2)
+
+        return f"{Ma}({a}) + {Mb}({b})"
+
+    def filename_add_difference():
+        a = primary_model_info.model_name
+        b = secondary_model_info.model_name
+        c = tertiary_model_info.model_name
+        M = round(multiplier, 2)
+
+        return f"{a} + {M}({b} - {c})"
+
+    def filename_nothing():
+        return primary_model_info.model_name
 
     theta_funcs = {
-        "Weighted sum": (None, weighted_sum),
-        "Add difference": (get_difference, add_difference),
+        "Weighted sum": (filename_weighted_sum, None, weighted_sum),
+        "Add difference": (filename_add_difference, get_difference, add_difference),
+        "No interpolation": (filename_nothing, None, None),
     }
-    theta_func1, theta_func2 = theta_funcs[interp_method]
+    filename_generator, theta_func1, theta_func2 = theta_funcs[interp_method]
+    shared.state.job_count = (1 if theta_func1 else 0) + (1 if theta_func2 else 0)
 
-    if theta_func1 and not tertiary_model_info:
-        return ["Failed: Interpolation method requires a tertiary model."] + [gr.Dropdown.update(choices=sd_models.checkpoint_tiles()) for _ in range(4)]
+    if not primary_model_name:
+        return fail("Failed: Merging requires a primary model.")
 
-    print(f"Loading {secondary_model_info.filename}...")
-    theta_1 = sd_models.read_state_dict(secondary_model_info.filename, map_location='cpu')
+    primary_model_info = sd_models.checkpoints_list[primary_model_name]
+
+    if theta_func2 and not secondary_model_name:
+        return fail("Failed: Merging requires a secondary model.")
+
+    secondary_model_info = sd_models.checkpoints_list[secondary_model_name] if theta_func2 else None
+
+    if theta_func1 and not tertiary_model_name:
+        return fail(f"Failed: Interpolation method ({interp_method}) requires a tertiary model.")
+
+    tertiary_model_info = sd_models.checkpoints_list[tertiary_model_name] if theta_func1 else None
+
+    result_is_inpainting_model = False
+
+    if theta_func2:
+        shared.state.textinfo = f"Loading B"
+        print(f"Loading {secondary_model_info.filename}...")
+        theta_1 = sd_models.read_state_dict(secondary_model_info.filename, map_location='cpu')
+    else:
+        theta_1 = None
 
     if theta_func1:
+        shared.state.textinfo = f"Loading C"
         print(f"Loading {tertiary_model_info.filename}...")
         theta_2 = sd_models.read_state_dict(tertiary_model_info.filename, map_location='cpu')
 
+        shared.state.textinfo = 'Merging B and C'
+        shared.state.sampling_steps = len(theta_1.keys())
         for key in tqdm.tqdm(theta_1.keys()):
+            if key in checkpoint_dict_skip_on_merge:
+                continue
+
             if 'model' in key:
                 if key in theta_2:
                     t2 = theta_2.get(key, torch.zeros_like(theta_1[key]))
                     theta_1[key] = theta_func1(theta_1[key], t2)
                 else:
                     theta_1[key] = torch.zeros_like(theta_1[key])
+
+            shared.state.sampling_step += 1
         del theta_2
 
+        shared.state.nextjob()
+
+    shared.state.textinfo = f"Loading {primary_model_info.filename}..."
     print(f"Loading {primary_model_info.filename}...")
     theta_0 = sd_models.read_state_dict(primary_model_info.filename, map_location='cpu')
 
     print("Merging...")
-
+    shared.state.textinfo = 'Merging A and B'
+    shared.state.sampling_steps = len(theta_0.keys())
     for key in tqdm.tqdm(theta_0.keys()):
-        if 'model' in key and key in theta_1:
+        if theta_1 and 'model' in key and key in theta_1:
+
+            if key in checkpoint_dict_skip_on_merge:
+                continue
+
             a = theta_0[key]
             b = theta_1[key]
 
@@ -305,31 +407,39 @@ def run_modelmerger(primary_model_name, secondary_model_name, tertiary_model_nam
             else:
                 theta_0[key] = theta_func2(a, b, multiplier)
 
-            if save_as_half:
-                theta_0[key] = theta_0[key].half()
+            theta_0[key] = to_half(theta_0[key], save_as_half)
 
-    # I believe this part should be discarded, but I'll leave it for now until I am sure
-    for key in theta_1.keys():
-        if 'model' in key and key not in theta_0:
-            theta_0[key] = theta_1[key]
-            if save_as_half:
-                theta_0[key] = theta_0[key].half()
+        shared.state.sampling_step += 1
+
     del theta_1
+
+    bake_in_vae_filename = sd_vae.vae_dict.get(bake_in_vae, None)
+    if bake_in_vae_filename is not None:
+        print(f"Baking in VAE from {bake_in_vae_filename}")
+        shared.state.textinfo = 'Baking in VAE'
+        vae_dict = sd_vae.load_vae_dict(bake_in_vae_filename, map_location='cpu')
+
+        for key in vae_dict.keys():
+            theta_0_key = 'first_stage_model.' + key
+            if theta_0_key in theta_0:
+                theta_0[theta_0_key] = to_half(vae_dict[key], save_as_half)
+
+        del vae_dict
+
+    if save_as_half and not theta_func2:
+        for key in theta_0.keys():
+            theta_0[key] = to_half(theta_0[key], save_as_half)
 
     ckpt_dir = shared.cmd_opts.ckpt_dir or sd_models.model_path
 
-    filename = \
-        primary_model_info.model_name + '_' + str(round(1-multiplier, 2)) + '-' + \
-        secondary_model_info.model_name + '_' + str(round(multiplier, 2)) + '-' + \
-        interp_method.replace(" ", "_") + \
-        '-merged.' +  \
-        ("inpainting." if result_is_inpainting_model else "") + \
-        checkpoint_format
-
-    filename = filename if custom_name == '' else (custom_name + '.' + checkpoint_format)
+    filename = filename_generator() if custom_name == '' else custom_name
+    filename += ".inpainting" if result_is_inpainting_model else ""
+    filename += "." + checkpoint_format
 
     output_modelname = os.path.join(ckpt_dir, filename)
 
+    shared.state.nextjob()
+    shared.state.textinfo = "Saving"
     print(f"Saving to {output_modelname}...")
 
     _, extension = os.path.splitext(output_modelname)
@@ -340,5 +450,10 @@ def run_modelmerger(primary_model_name, secondary_model_name, tertiary_model_nam
 
     sd_models.list_models()
 
-    print("Checkpoint saved.")
-    return ["Checkpoint saved to " + output_modelname] + [gr.Dropdown.update(choices=sd_models.checkpoint_tiles()) for _ in range(4)]
+    create_config(output_modelname, config_source, primary_model_info, secondary_model_info, tertiary_model_info)
+
+    print(f"Checkpoint saved to {output_modelname}.")
+    shared.state.textinfo = "Checkpoint saved"
+    shared.state.end()
+
+    return [*[gr.Dropdown.update(choices=sd_models.checkpoint_tiles()) for _ in range(4)], "Checkpoint saved to " + output_modelname]
